@@ -14,6 +14,9 @@ use libgen::api::download::DownloadRequest;
 use libgen::api::mirrors::{Mirror, MirrorList, MirrorType};
 use libgen::api::search::{Search, SearchOption};
 
+pub mod cli_args;
+use crate::libgen_cli::cli_args::Args;
+
 lazy_static! {
     static ref RED_STYLE: Style = Style::new().red();
 }
@@ -130,78 +133,152 @@ pub fn select_download_mirror(mirrors: &MirrorList) -> Result<Mirror, &'static s
     mirrors.get(MirrorType::Download, mirror_selection.unwrap())
 }
 
-pub async fn init() -> Result<(), &'static str> {
-    let client = Client::new();
-    let mirrors = parse_mirrors();
-    let search_mirror = match select_search_mirror(&mirrors) {
+async fn search_loop(
+    args: &Args,
+    mirrors: &MirrorList,
+    client: &Client,
+) -> Result<Vec<Book>, &'static str> {
+    let search_mirror = match select_search_mirror(mirrors) {
         Ok(mirror) => mirror,
         Err(_) => return Err("You must select a mirror"),
     };
-    let books = loop {
-        let request = input_search_request().expect("Empty request");
-        let search_option = input_search_option().unwrap();
-        let results = input_results_count().unwrap();
-        let search_options: Search = Search {
-            mirror: search_mirror.clone(),
-            request,
-            results,
-            search_option,
-        };
-        println!("Search at {}... This may take a while", search_mirror);
-        let received_books = search_options.search(&client).await?;
-        if received_books.is_empty() {
-            println!("Books not found");
-            continue;
-        } else {
-            break received_books;
-        }
+    let request = match &args.search {
+        Some(req) => String::from(req),
+        None => input_search_request().expect("Empty request"),
     };
-    loop {
-        let selected_book = fuzzyselect_book(&books).expect("Empty book");
-        print_book_info(&selected_book).unwrap();
-        if !Confirm::new()
-            .with_prompt("Do you want to download this book?")
-            .interact()
-            .unwrap()
-        {
-            continue;
-        }
-        let download_mirror = select_download_mirror(&mirrors).unwrap();
-        let download_request = DownloadRequest {
-            mirror: download_mirror,
-        };
-        let down_req = download_request
-            .download_book(&client, &selected_book)
-            .await?;
-        let total_size = down_req.content_length().unwrap();
+    let search_option = input_search_option().unwrap();
+    let results = input_results_count().unwrap();
+    let search_options: Search = Search {
+        mirror: search_mirror.clone(),
+        request,
+        results,
+        search_option,
+    };
+    println!("Search at {}... This may take a while", search_mirror);
+    let received_books = search_options.search(client).await?;
+    if received_books.is_empty() {
+        Err("Books not found")
+    } else {
+        Ok(received_books)
+    }
+}
 
-        let pb = ProgressBar::new(total_size);
-        pb.set_style(ProgressStyle::default_bar()
+async fn download_loop(
+    mirrors: &MirrorList,
+    books: &[Book],
+    client: &Client,
+) -> Result<bool, &'static str> {
+    let selected_book = fuzzyselect_book(books).expect("Empty book");
+    print_book_info(&selected_book).unwrap();
+    if !Confirm::new()
+        .with_prompt("Do you want to download this book?")
+        .interact()
+        .unwrap()
+    {
+        return Ok(false);
+    }
+    let download_mirror = select_download_mirror(mirrors).unwrap();
+    let download_request = DownloadRequest {
+        mirror: download_mirror,
+    };
+    let down_req = download_request
+        .download_book(client, &selected_book)
+        .await?;
+    let total_size = down_req.content_length().unwrap();
+
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(ProgressStyle::default_bar()
         .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
         .unwrap()
         .progress_chars("#>-"));
-        pb.set_message("Downloading...");
+    pb.set_message("Downloading...");
 
-        let mut book_download_path = dirs::download_dir().unwrap();
-        book_download_path.push("libgen-rs");
-        std::fs::create_dir_all(&book_download_path).unwrap();
-        if selected_book.title.len() >= 249 {
-            book_download_path.push(&selected_book.title[0..249]);
-        } else {
-            book_download_path.push(&selected_book.title);
+    let mut book_download_path = dirs::download_dir().unwrap();
+    book_download_path.push("libgen-rs");
+    std::fs::create_dir_all(&book_download_path).unwrap();
+    if selected_book.title.len() >= 249 {
+        book_download_path.push(&selected_book.title[0..249]);
+    } else {
+        book_download_path.push(&selected_book.title);
+    }
+    book_download_path.set_extension(&selected_book.extension);
+    let mut stream = down_req.bytes_stream();
+    let mut file = File::create(book_download_path).unwrap();
+    let mut downloaded: u64 = 0;
+    while let Some(item) = stream.next().await {
+        let chunk = item.or(Err("Error while downloading file")).unwrap();
+        file.write_all(&chunk).unwrap();
+        let new = min(downloaded + (chunk.len() as u64), total_size);
+        downloaded = new;
+        pb.set_position(new);
+    }
+    Ok(true)
+}
+
+async fn download_book_from_md5(
+    mirrors: &MirrorList,
+    client: &Client,
+    md5: String,
+) -> Result<(), &'static str> {
+    let search_mirror = match select_search_mirror(mirrors) {
+        Ok(mirror) => mirror,
+        Err(_) => return Err("You must select a mirror"),
+    };
+    let search_options: Search = Search {
+        mirror: search_mirror.clone(),
+        request: md5,
+        results: 25,
+        search_option: SearchOption::MD5,
+    };
+    println!("Search at {}... This may take a while", search_mirror);
+    let received_books = search_options.search(client).await?;
+    if received_books.is_empty() {
+        return Err("Books not found");
+    } else {
+        download_loop(mirrors, &received_books, client).await?;
+    }
+    Ok(())
+}
+
+pub async fn init(args: &Args) -> Result<(), &'static str> {
+    let client = Client::new();
+    let mirrors = parse_mirrors();
+
+    if args.download.is_some() {
+        download_book_from_md5(
+            &mirrors,
+            &client,
+            String::from(args.download.as_ref().unwrap()),
+        )
+        .await
+        .unwrap();
+        return Ok(());
+    }
+
+    let books = loop {
+        match search_loop(args, &mirrors, &client).await {
+            Ok(books) => break books,
+            Err(err) => {
+                if args.search.is_none() {
+                    continue;
+                } else {
+                    return Err(err);
+                }
+            }
         }
-        book_download_path.set_extension(&selected_book.extension);
-        let mut stream = down_req.bytes_stream();
-        let mut file = File::create(book_download_path).unwrap();
-        let mut downloaded: u64 = 0;
-        while let Some(item) = stream.next().await {
-            let chunk = item.or(Err("Error while downloading file")).unwrap();
-            file.write_all(&chunk).unwrap();
-            let new = min(downloaded + (chunk.len() as u64), total_size);
-            downloaded = new;
-            pb.set_position(new);
+    };
+
+    loop {
+        match download_loop(&mirrors, &books, &client).await {
+            Ok(v) => {
+                if v {
+                    break;
+                } else {
+                    continue;
+                }
+            }
+            Err(err) => return Err(err),
         }
-        break;
     }
 
     Ok(())
